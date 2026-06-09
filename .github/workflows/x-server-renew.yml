@@ -1,0 +1,211 @@
+name: XServer Extend
+
+on:
+  schedule:
+    - cron: '17 1,9,17 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: xserver-renew
+  cancel-in-progress: false
+
+jobs:
+  precheck:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+      reason: ${{ steps.check.outputs.reason }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          ref: main
+
+      - name: Check state.json
+        id: check
+        env:
+          ALL_SECRETS: ${{ toJson(secrets) }}
+          ALL_VARS: ${{ toJson(vars) }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+
+          function parseJsonEnv(name) {
+            try {
+              if (!process.env[name]) return {};
+              return JSON.parse(process.env[name]);
+            } catch {
+              return {};
+            }
+          }
+
+          const env = {
+            ...parseJsonEnv('ALL_VARS'),
+            ...parseJsonEnv('ALL_SECRETS'),
+            ...process.env
+          };
+
+          function out(name, value) {
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `${name}=${value}\n`);
+          }
+
+          const keys = Object.keys(env)
+            .map(k => {
+              const m = k.match(/^X_SERVER_([A-Za-z0-9_]+)$/);
+              return m ? m[1] : null;
+            })
+            .filter(Boolean)
+            .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+
+          if (!keys.length) {
+            console.log('No X_SERVER_xxx accounts found.');
+            out('should_run', 'false');
+            out('reason', 'no_accounts');
+            process.exit(0);
+          }
+
+          if (!fs.existsSync('state.json')) {
+            console.log('state.json not found. Need initial run.');
+            out('should_run', 'true');
+            out('reason', 'no_state');
+            process.exit(0);
+          }
+
+          let state = {};
+          try {
+            state = JSON.parse(fs.readFileSync('state.json', 'utf8'));
+          } catch {
+            console.log('state.json invalid. Need run.');
+            out('should_run', 'true');
+            out('reason', 'invalid_state');
+            process.exit(0);
+          }
+
+          const now = Date.now();
+          const due = [];
+          const missing = [];
+
+          for (const key of keys) {
+            const s = state[key];
+
+            if (!s || !s.renewTime) {
+              missing.push(key);
+              continue;
+            }
+
+            if (now >= Number(s.renewTime)) {
+              due.push(key);
+            }
+          }
+
+          if (missing.length || due.length) {
+            const reason = [
+              missing.length ? `missing:${missing.join(',')}` : '',
+              due.length ? `due:${due.join(',')}` : ''
+            ].filter(Boolean).join(';');
+
+            console.log(`Need run: ${reason}`);
+            out('should_run', 'true');
+            out('reason', reason || 'need_run');
+          } else {
+            console.log('No account reached renewTime. Skip dependency installation.');
+            out('should_run', 'false');
+            out('reason', 'not_due');
+          }
+          NODE
+
+  renew:
+    needs: precheck
+    if: needs.precheck.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Sync latest state
+        run: |
+          git fetch origin main
+          git reset --hard origin/main
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+          sudo apt-get update
+          sudo apt-get install -y wget fonts-noto-cjk
+
+      - name: Download sing-box
+        run: |
+          SINGBOX_VER="1.11.0"
+          wget -q "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
+          tar -xzf "sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
+          mv "sing-box-${SINGBOX_VER}-linux-amd64/sing-box" ./sing-box
+          chmod +x ./sing-box
+          ./sing-box version
+
+      - name: Run renew script
+        env:
+          ALL_SECRETS: ${{ toJson(secrets) }}
+          ALL_VARS: ${{ toJson(vars) }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: node renew.js
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xserver-artifacts
+          path: |
+            *.png
+            singbox.log
+            config.json
+          retention-days: 5
+
+      - name: Persist state.json
+        if: always()
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          if [ ! -f state.json ]; then
+            echo "{}" > state.json
+          fi
+
+          git add state.json
+
+          if git diff --cached --quiet; then
+            echo "No state.json changes"
+            exit 0
+          fi
+
+          git commit -m "chore: update xserver state [skip ci]"
+          git pull --rebase origin main || true
+          git push origin HEAD:main
+
+  skipped:
+    needs: precheck
+    if: needs.precheck.outputs.should_run != 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Skip
+        run: |
+          echo "No account reached renewTime."
+          echo "Reason: ${{ needs.precheck.outputs.reason }}"
