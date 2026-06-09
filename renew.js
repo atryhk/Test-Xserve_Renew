@@ -51,17 +51,29 @@ function safeFileName(s) {
 
 function maskEmail(email) {
   if (!email) return '';
+
   const [name, domain] = email.split('@');
   if (!domain) return email.slice(0, 2) + '***';
 
-  const maskedName = name.length <= 2 ? name.slice(0, 1) + '***' : name.slice(0, 2) + '***';
-  const parts = domain.split('.');
+  const maskedName = name.length <= 2
+    ? name.slice(0, 1) + '***'
+    : name.slice(0, 2) + '***';
 
-  if (parts.length >= 2) {
-    return `${maskedName}@${parts[0].slice(0, 2)}***.${parts.slice(1).join('.')}`;
+  const labels = domain.split('.').filter(Boolean);
+
+  if (labels.length === 1) {
+    return `${maskedName}@${labels[0].slice(0, 2)}***`;
   }
 
-  return `${maskedName}@${domain.slice(0, 2)}***`;
+  if (labels.length === 2) {
+    return `${maskedName}@${labels[0].slice(0, 2)}***.${labels[1]}`;
+  }
+
+  const first = labels[0].slice(0, 2) + '***';
+  const middle = labels.slice(1, -1).map(() => '***');
+  const last = labels[labels.length - 1];
+
+  return `${maskedName}@${[first, ...middle, last].join('.')}`;
 }
 
 function maskHost(host) {
@@ -84,20 +96,6 @@ function maskHost(host) {
   }
 
   return host.slice(0, 2) + '***';
-}
-
-function maskProxy(proxy) {
-  if (!proxy || proxy === 'DIRECT') return 'DIRECT';
-
-  try {
-    const u = new URL(proxy);
-    const scheme = u.protocol.replace(':', '');
-    const port = u.port ? ':' + u.port : '';
-    return `${scheme}://${maskHost(u.hostname)}${port}`;
-  } catch {
-    const scheme = proxy.includes('://') ? proxy.split('://')[0] : 'unknown';
-    return `${scheme}://***`;
-  }
 }
 
 function loadState() {
@@ -133,7 +131,10 @@ function discoverAccountKeys() {
   }
 
   return [...new Set(keys)].sort((a, b) => {
-    return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+    return a.localeCompare(b, undefined, {
+      numeric: true,
+      sensitivity: 'base'
+    });
   });
 }
 
@@ -235,13 +236,12 @@ function shouldRunAccount(account, noStateFile) {
   };
 }
 
-async function sendTG(tg, title, lines) {
+async function sendTG(tg, lines) {
   if (!tg.token || !tg.chatId) return;
 
   const text = [
-    title,
-    ...lines,
-    `时间: ${formatTimeUTC8(Date.now())}`
+    '🎮 XServer 延期通知',
+    ...lines
   ].join('\n');
 
   try {
@@ -265,7 +265,6 @@ function writeScheduleByRemaining(account, remainingMins, reason) {
   const now = Date.now();
   const expireTime = now + remainingMins * 60 * 1000;
   const renewTime = expireTime - account.threshold * 3600000;
-
   const safeRenewTime = Math.max(now + 30 * 60 * 1000, renewTime);
 
   updateState(account.key, {
@@ -453,9 +452,14 @@ async function checkIp(page, account) {
 
     const body = await page.textContent('body');
     const ip = JSON.parse(body).ip;
-    console.log(`🌐 [${account.key}] 当前出口 IP: ${maskHost(ip)}`);
+    const maskedIp = maskHost(ip);
+
+    console.log(`🌐 [${account.key}] 当前出口 IP: ${maskedIp}`);
+
+    return maskedIp;
   } catch {
     console.log(`⚠️ [${account.key}] 出口 IP 检查失败`);
+    return '';
   }
 }
 
@@ -554,7 +558,7 @@ async function runBrowserFlow(account, proxyServer) {
   const page = await context.newPage();
 
   try {
-    await checkIp(page, account);
+    const proxyIp = await checkIp(page, account);
 
     console.log(`🌐 [${account.key}] 打开登录页面`);
     await page.goto(LOGIN_URL, {
@@ -603,6 +607,7 @@ async function runBrowserFlow(account, proxyServer) {
 
       return {
         action: 'renewed',
+        proxyIp,
         ...renewed
       };
     }
@@ -616,6 +621,7 @@ async function runBrowserFlow(account, proxyServer) {
 
       return {
         action: 'renewed',
+        proxyIp,
         ...renewed
       };
     }
@@ -624,6 +630,7 @@ async function runBrowserFlow(account, proxyServer) {
 
     return {
       action: 'not_due',
+      proxyIp,
       remainingH: hours.toFixed(1)
     };
   } catch (e) {
@@ -646,24 +653,24 @@ async function runOneAccount(account) {
   await sleep(delayMinutes * 60 * 1000);
 
   let lastError = null;
-  let lastProxy = '';
+  let lastIp = '';
 
   for (const proxy of account.proxies) {
     let runtime = null;
-    const maskedProxy = maskProxy(proxy.value);
-    lastProxy = maskedProxy;
 
     try {
-      console.log(`🌐 [${account.key}] 尝试${proxy.name}: ${maskedProxy}`);
+      console.log(`🌐 [${account.key}] 尝试${proxy.name}`);
 
       runtime = await startProxy(proxy.value);
       const result = await runBrowserFlow(account, runtime.proxyServer);
+
+      lastIp = result.proxyIp || '';
 
       return {
         key: account.key,
         account: account.emailMasked,
         status: result.action,
-        proxy: maskedProxy,
+        ip: lastIp,
         result
       };
     } catch (e) {
@@ -680,7 +687,7 @@ async function runOneAccount(account) {
     key: account.key,
     account: account.emailMasked,
     status: 'failed',
-    proxy: lastProxy,
+    ip: lastIp,
     error: lastError ? lastError.message : '未知错误'
   };
 }
@@ -735,13 +742,14 @@ async function main() {
         key,
         account: '',
         status: 'failed',
-        proxy: '',
+        ip: '',
         error: e.message
       });
     }
   }
 
   const renewed = results.filter(r => r.status === 'renewed');
+  const notDue = results.filter(r => r.status === 'not_due');
   const failed = results.filter(r => r.status === 'failed');
 
   const shouldNotifyInit = noStateFile && isManual;
@@ -750,41 +758,32 @@ async function main() {
   if (shouldNotify) {
     const lines = [];
 
-    if (renewed.length) {
-      lines.push('✅ 续期成功');
-      for (const r of renewed) {
-        lines.push(
-          `[${r.key}] ${r.account}`,
-          `代理: ${r.proxy}`,
-          `续期前: ${r.result.beforeH}h`,
-          `续期后: ${r.result.afterH}h`,
-          `到期时间: ${r.result.schedule.expireTimeStr}`,
-          `下次可续期检查: ${r.result.schedule.renewTimeStr}`
-        );
-      }
+    for (const r of renewed) {
+      lines.push(
+        '✅ 续期成功',
+        `账号: [${r.key}] ${r.account}`,
+        `代理IP: ${r.ip || '未知'}`,
+        `时间: ${r.result.beforeH}h → ${r.result.afterH}h`,
+        `下次到期: ${r.result.schedule.expireTimeStr}`
+      );
     }
 
-    if (failed.length) {
-      lines.push('❌ 续期失败');
-      for (const r of failed) {
-        lines.push(
-          `[${r.key}] ${r.account || ''}`,
-          `代理: ${r.proxy || ''}`,
-          `错误: ${r.error || '未知错误'}`,
-          '已设置 1 小时后重试'
-        );
-      }
+    for (const r of failed) {
+      lines.push(
+        '❌ 续期失败',
+        `账号: [${r.key}] ${r.account || ''}`,
+        `代理IP: ${r.ip || '未知'}`,
+        `错误: ${r.error || '未知错误'}`
+      );
     }
 
     if (shouldNotifyInit && !renewed.length && !failed.length) {
-      lines.push('ℹ️ 首次手动初始化完成');
-      lines.push(`检测账号数: ${keys.length}`);
-      lines.push(`实际检查账号数: ${results.length}`);
-      lines.push(`未到续期账号数: ${results.filter(r => r.status === 'not_due').length}`);
-      lines.push('state.json 已生成，后续定时任务会先按可续期时间预检查');
+      lines.push('ℹ️ 首次初始化完成');
     }
 
-    await sendTG(tg, 'XServer 延期通知', lines);
+    lines.push(`汇总: 成功 ${renewed.length}，未到期 ${notDue.length + skipped.length}，失败 ${failed.length}`);
+
+    await sendTG(tg, lines);
   } else {
     console.log('🔕 无续期成功/失败，且不是首次手动初始化，不发送通知');
   }
